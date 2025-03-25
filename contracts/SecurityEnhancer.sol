@@ -5,279 +5,205 @@ import "@openzeppelin/contracts/access/AccessControl.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/security/Pausable.sol";
 import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
+import "@openzeppelin/contracts/utils/cryptography/MerkleProof.sol";
 
 contract SecurityEnhancer is AccessControl, ReentrancyGuard, Pausable {
     using ECDSA for bytes32;
 
-    bytes32 public constant SECURITY_ADMIN_ROLE = keccak256("SECURITY_ADMIN_ROLE");
-    bytes32 public constant GUARDIAN_ROLE = keccak256("GUARDIAN_ROLE");
+    bytes32 public constant SECURITY_ADMIN = keccak256("SECURITY_ADMIN");
+    bytes32 public constant VALIDATOR_ROLE = keccak256("VALIDATOR_ROLE");
 
     struct SecurityConfig {
         uint256 maxTransactionValue;
         uint256 dailyLimit;
         uint256 cooldownPeriod;
-        uint256 requiredApprovals;
-        bool requireMultisig;
+        uint256 validationThreshold;
+        bool requireMultiSig;
     }
 
-    struct Transaction {
-        bytes32 txHash;
+    struct ValidationRequest {
+        bytes32 id;
         address initiator;
-        bytes data;
-        uint256 value;
+        bytes32 operationHash;
         uint256 timestamp;
-        TransactionStatus status;
-        uint256 approvalCount;
-        mapping(address => bool) approvals;
+        uint256 validations;
+        mapping(address => bool) hasValidated;
+        bool executed;
     }
 
-    struct GuardianKey {
-        bytes publicKey;
-        uint256 lastRotation;
-        bool isActive;
+    struct SecurityMetrics {
+        uint256 suspiciousTransactions;
+        uint256 blockedTransactions;
+        uint256 lastUpdated;
+        bytes32 securityStateRoot;
     }
 
-    enum TransactionStatus {
-        Pending,
-        Approved,
-        Executed,
-        Rejected,
-        Cancelled
-    }
+    mapping(uint256 => SecurityConfig) public chainConfigs;
+    mapping(bytes32 => ValidationRequest) public validationRequests;
+    mapping(address => uint256) public dailyTransactionVolume;
+    mapping(address => uint256) public lastTransactionTimestamp;
+    mapping(bytes32 => bool) public blacklistedOperations;
 
-    mapping(bytes32 => Transaction) public transactions;
-    mapping(address => GuardianKey) public guardianKeys;
-    mapping(address => uint256) public dailyTransactions;
-    mapping(address => uint256) public lastTransactionTime;
-    mapping(address => uint256) public consecutiveFailedAttempts;
+    bytes32 public immutable DOMAIN_SEPARATOR;
+    mapping(address => uint256) public nonces;
 
-    SecurityConfig public config;
-    uint256 public constant MAX_FAILED_ATTEMPTS = 3;
-    uint256 public constant LOCKOUT_DURATION = 24 hours;
-
-    event TransactionInitiated(
-        bytes32 indexed txHash,
-        address indexed initiator,
-        uint256 value
-    );
-    event TransactionApproved(
-        bytes32 indexed txHash,
-        address indexed approver
-    );
-    event TransactionExecuted(
-        bytes32 indexed txHash,
-        address indexed executor
-    );
+    event SecurityConfigUpdated(uint256 indexed chainId, SecurityConfig config);
+    event ValidationRequested(bytes32 indexed requestId, address initiator);
+    event ValidationProvided(bytes32 indexed requestId, address validator);
+    event OperationExecuted(bytes32 indexed requestId, bool success);
     event SecurityAlert(
-        address indexed subject,
+        uint256 indexed chainId,
         string alertType,
-        string details
-    );
-    event GuardianKeyRotated(
-        address indexed guardian,
-        bytes newPublicKey
+        uint256 severity
     );
 
-    constructor(
-        uint256 _maxTransactionValue,
-        uint256 _dailyLimit,
-        uint256 _cooldownPeriod,
-        uint256 _requiredApprovals
-    ) {
+    constructor() {
         _setupRole(DEFAULT_ADMIN_ROLE, msg.sender);
-        _setupRole(SECURITY_ADMIN_ROLE, msg.sender);
+        _setupRole(SECURITY_ADMIN, msg.sender);
 
-        config = SecurityConfig({
-            maxTransactionValue: _maxTransactionValue,
-            dailyLimit: _dailyLimit,
-            cooldownPeriod: _cooldownPeriod,
-            requiredApprovals: _requiredApprovals,
-            requireMultisig: true
-        });
-    }
-
-    modifier notLocked(address _account) {
-        require(
-            block.timestamp >= lastTransactionTime[_account] + LOCKOUT_DURATION ||
-            consecutiveFailedAttempts[_account] < MAX_FAILED_ATTEMPTS,
-            "Account temporarily locked"
+        DOMAIN_SEPARATOR = keccak256(
+            abi.encode(
+                keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
+                keccak256(bytes("SecurityEnhancer")),
+                keccak256(bytes("1")),
+                block.chainid,
+                address(this)
+            )
         );
-        _;
-    }
-
-    modifier withinLimits(uint256 _value) {
-        require(_value <= config.maxTransactionValue, "Exceeds transaction limit");
-        require(
-            dailyTransactions[msg.sender] + _value <= config.dailyLimit,
-            "Exceeds daily limit"
-        );
-        _;
-    }
-
-    function initiateTransaction(
-        bytes memory _data,
-        uint256 _value,
-        bytes memory _signature
-    ) external notLocked(msg.sender) withinLimits(_value) nonReentrant returns (bytes32) {
-        require(
-            block.timestamp >= lastTransactionTime[msg.sender] + config.cooldownPeriod,
-            "Cooldown period not elapsed"
-        );
-
-        bytes32 txHash = keccak256(abi.encodePacked(
-            _data,
-            _value,
-            block.timestamp,
-            msg.sender
-        ));
-
-        // Verify signature
-        require(verifySignature(txHash, _signature), "Invalid signature");
-
-        Transaction storage transaction = transactions[txHash];
-        transaction.txHash = txHash;
-        transaction.initiator = msg.sender;
-        transaction.data = _data;
-        transaction.value = _value;
-        transaction.timestamp = block.timestamp;
-        transaction.status = TransactionStatus.Pending;
-
-        if (!config.requireMultisig) {
-            transaction.status = TransactionStatus.Approved;
-        }
-
-        emit TransactionInitiated(txHash, msg.sender, _value);
-        return txHash;
-    }
-
-    function approveTransaction(
-        bytes32 _txHash,
-        bytes memory _signature
-    ) external onlyRole(GUARDIAN_ROLE) nonReentrant {
-        Transaction storage transaction = transactions[_txHash];
-        require(
-            transaction.status == TransactionStatus.Pending,
-            "Invalid transaction status"
-        );
-        require(!transaction.approvals[msg.sender], "Already approved");
-
-        // Verify guardian signature
-        require(
-            verifyGuardianSignature(_txHash, _signature, msg.sender),
-            "Invalid guardian signature"
-        );
-
-        transaction.approvals[msg.sender] = true;
-        transaction.approvalCount++;
-
-        if (transaction.approvalCount >= config.requiredApprovals) {
-            transaction.status = TransactionStatus.Approved;
-        }
-
-        emit TransactionApproved(_txHash, msg.sender);
-    }
-
-    function executeTransaction(bytes32 _txHash)
-        external
-        nonReentrant
-        returns (bool)
-    {
-        Transaction storage transaction = transactions[_txHash];
-        require(
-            transaction.status == TransactionStatus.Approved,
-            "Transaction not approved"
-        );
-
-        (bool success, ) = transaction.initiator.call{value: transaction.value}(
-            transaction.data
-        );
-
-        if (success) {
-            transaction.status = TransactionStatus.Executed;
-            dailyTransactions[transaction.initiator] += transaction.value;
-            lastTransactionTime[transaction.initiator] = block.timestamp;
-            consecutiveFailedAttempts[transaction.initiator] = 0;
-            emit TransactionExecuted(_txHash, msg.sender);
-        } else {
-            consecutiveFailedAttempts[transaction.initiator]++;
-            if (consecutiveFailedAttempts[transaction.initiator] >= MAX_FAILED_ATTEMPTS) {
-                emit SecurityAlert(
-                    transaction.initiator,
-                    "ACCOUNT_LOCKED",
-                    "Too many failed attempts"
-                );
-            }
-        }
-
-        return success;
-    }
-
-    function rotateGuardianKey(bytes memory _newPublicKey, bytes memory _signature)
-        external
-        onlyRole(GUARDIAN_ROLE)
-    {
-        require(_newPublicKey.length > 0, "Invalid public key");
-        
-        bytes32 messageHash = keccak256(abi.encodePacked(
-            msg.sender,
-            _newPublicKey,
-            block.timestamp
-        ));
-
-        require(
-            verifyGuardianSignature(messageHash, _signature, msg.sender),
-            "Invalid signature"
-        );
-
-        guardianKeys[msg.sender] = GuardianKey({
-            publicKey: _newPublicKey,
-            lastRotation: block.timestamp,
-            isActive: true
-        });
-
-        emit GuardianKeyRotated(msg.sender, _newPublicKey);
-    }
-
-    function verifySignature(bytes32 _messageHash, bytes memory _signature)
-        internal
-        view
-        returns (bool)
-    {
-        bytes32 ethSignedMessageHash = _messageHash.toEthSignedMessageHash();
-        address signer = ethSignedMessageHash.recover(_signature);
-        return signer == msg.sender;
-    }
-
-    function verifyGuardianSignature(
-        bytes32 _messageHash,
-        bytes memory _signature,
-        address _guardian
-    ) internal view returns (bool) {
-        require(guardianKeys[_guardian].isActive, "Guardian key not active");
-        bytes32 ethSignedMessageHash = _messageHash.toEthSignedMessageHash();
-        address signer = ethSignedMessageHash.recover(_signature);
-        return signer == _guardian;
     }
 
     function updateSecurityConfig(
-        uint256 _maxTransactionValue,
-        uint256 _dailyLimit,
-        uint256 _cooldownPeriod,
-        uint256 _requiredApprovals,
-        bool _requireMultisig
-    ) external onlyRole(SECURITY_ADMIN_ROLE) {
-        config.maxTransactionValue = _maxTransactionValue;
-        config.dailyLimit = _dailyLimit;
-        config.cooldownPeriod = _cooldownPeriod;
-        config.requiredApprovals = _requiredApprovals;
-        config.requireMultisig = _requireMultisig;
+        uint256 chainId,
+        SecurityConfig memory config
+    ) external onlyRole(SECURITY_ADMIN) {
+        require(config.maxTransactionValue > 0, "Invalid max value");
+        require(config.dailyLimit > 0, "Invalid daily limit");
+        chainConfigs[chainId] = config;
+        emit SecurityConfigUpdated(chainId, config);
     }
 
-    function pause() external onlyRole(SECURITY_ADMIN_ROLE) {
+    function requestValidation(
+        bytes32 operationHash
+    ) external whenNotPaused returns (bytes32) {
+        require(!blacklistedOperations[operationHash], "Operation blacklisted");
+        
+        bytes32 requestId = keccak256(
+            abi.encodePacked(
+                operationHash,
+                msg.sender,
+                block.timestamp
+            )
+        );
+
+        ValidationRequest storage request = validationRequests[requestId];
+        request.id = requestId;
+        request.initiator = msg.sender;
+        request.operationHash = operationHash;
+        request.timestamp = block.timestamp;
+        request.validations = 0;
+        request.executed = false;
+
+        emit ValidationRequested(requestId, msg.sender);
+        return requestId;
+    }
+
+    function validateOperation(
+        bytes32 requestId,
+        bytes calldata signature
+    ) external whenNotPaused nonReentrant {
+        ValidationRequest storage request = validationRequests[requestId];
+        require(request.id != bytes32(0), "Request not found");
+        require(!request.executed, "Already executed");
+        require(
+            !request.hasValidated[msg.sender],
+            "Already validated"
+        );
+        require(
+            hasRole(VALIDATOR_ROLE, msg.sender),
+            "Not a validator"
+        );
+
+        bytes32 messageHash = keccak256(
+            abi.encodePacked(
+                "\x19\x01",
+                DOMAIN_SEPARATOR,
+                keccak256(abi.encode(
+                    requestId,
+                    request.operationHash,
+                    nonces[msg.sender]++
+                ))
+            )
+        );
+
+        address signer = messageHash.recover(signature);
+        require(signer == msg.sender, "Invalid signature");
+
+        request.hasValidated[msg.sender] = true;
+        request.validations++;
+
+        emit ValidationProvided(requestId, msg.sender);
+
+        SecurityConfig memory config = chainConfigs[block.chainid];
+        if (request.validations >= config.validationThreshold) {
+            _executeOperation(requestId);
+        }
+    }
+
+    function _executeOperation(bytes32 requestId) private {
+        ValidationRequest storage request = validationRequests[requestId];
+        require(!request.executed, "Already executed");
+
+        SecurityConfig memory config = chainConfigs[block.chainid];
+        address initiator = request.initiator;
+
+        // Check daily limit
+        uint256 currentDay = block.timestamp / 1 days;
+        uint256 lastDay = lastTransactionTimestamp[initiator] / 1 days;
+        if (currentDay > lastDay) {
+            dailyTransactionVolume[initiator] = 0;
+        }
+
+        require(
+            dailyTransactionVolume[initiator] + msg.value <= config.dailyLimit,
+            "Daily limit exceeded"
+        );
+
+        // Check cooldown
+        require(
+            block.timestamp >= lastTransactionTimestamp[initiator] + config.cooldownPeriod,
+            "Cooldown period active"
+        );
+
+        request.executed = true;
+        dailyTransactionVolume[initiator] += msg.value;
+        lastTransactionTimestamp[initiator] = block.timestamp;
+
+        emit OperationExecuted(requestId, true);
+    }
+
+    function blacklistOperation(
+        bytes32 operationHash
+    ) external onlyRole(SECURITY_ADMIN) {
+        blacklistedOperations[operationHash] = true;
+    }
+
+    function isOperationValid(
+        bytes32 operationHash,
+        bytes32[] calldata merkleProof,
+        bytes32 root
+    ) external pure returns (bool) {
+        return MerkleProof.verify(merkleProof, root, operationHash);
+    }
+
+    function emergencyShutdown() external onlyRole(SECURITY_ADMIN) {
         _pause();
     }
 
-    function unpause() external onlyRole(SECURITY_ADMIN_ROLE) {
+    function resumeOperations() external onlyRole(SECURITY_ADMIN) {
         _unpause();
+    }
+
+    receive() external payable {
+        require(msg.value <= chainConfigs[block.chainid].maxTransactionValue, "Value too high");
     }
 } 
