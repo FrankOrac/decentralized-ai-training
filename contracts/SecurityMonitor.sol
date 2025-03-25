@@ -4,114 +4,113 @@ pragma solidity ^0.8.19;
 import "@openzeppelin/contracts/access/AccessControl.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/security/Pausable.sol";
-import "@chainlink/contracts/src/v0.8/ChainlinkClient.sol";
+import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
 
-contract SecurityMonitor is AccessControl, ReentrancyGuard, Pausable, ChainlinkClient {
-    bytes32 public constant GUARDIAN_ROLE = keccak256("GUARDIAN_ROLE");
+contract SecurityMonitor is AccessControl, ReentrancyGuard, Pausable {
+    bytes32 public constant SECURITY_ADMIN = keccak256("SECURITY_ADMIN");
     bytes32 public constant MONITOR_ROLE = keccak256("MONITOR_ROLE");
 
     struct SecurityThreshold {
-        uint256 maxGasPerTx;
-        uint256 maxTxPerBlock;
-        uint256 maxValuePerTx;
-        uint256 cooldownPeriod;
-        uint256 requiredConfirmations;
+        uint256 minTrustScore;
+        uint256 maxLatency;
+        uint256 minParticipation;
+        uint256 consensusThreshold;
     }
 
     struct SecurityIncident {
         bytes32 id;
-        string incidentType;
-        address target;
-        uint256 severity;
         uint256 timestamp;
-        bool isResolved;
-        mapping(address => bool) guardianApprovals;
-        bytes evidence;
+        uint16 chainId;
+        string incidentType;
+        string description;
+        uint256 severity;
+        bool resolved;
+        mapping(address => bool) validations;
+        uint256 validationCount;
     }
 
-    struct ContractGuard {
-        bool isProtected;
-        mapping(bytes4 => bool) restrictedFunctions;
-        mapping(address => uint256) lastInteraction;
-        uint256 dailyLimit;
-        uint256 dailyUsed;
-        uint256 lastResetTime;
+    struct ChainHealth {
+        uint256 lastUpdate;
+        uint256 latency;
+        uint256 participation;
+        uint256 trustScore;
+        bool isHealthy;
     }
 
-    mapping(address => ContractGuard) public protectedContracts;
+    mapping(uint16 => SecurityThreshold) public chainThresholds;
     mapping(bytes32 => SecurityIncident) public incidents;
-    mapping(address => SecurityThreshold) public thresholds;
+    mapping(uint16 => ChainHealth) public chainHealth;
+    mapping(string => address) public securityOracles;
     
-    uint256 public constant SEVERITY_THRESHOLD = 7;
-    uint256 public constant MAX_INCIDENT_DURATION = 24 hours;
+    uint256 public constant MIN_VALIDATIONS = 2;
+    uint256 public immutable VALIDATION_TIMEOUT;
 
     event SecurityIncidentReported(
         bytes32 indexed incidentId,
+        uint16 chainId,
         string incidentType,
-        address target,
         uint256 severity
     );
-    event IncidentResolved(
+    event IncidentValidated(
         bytes32 indexed incidentId,
-        address resolver
+        address validator,
+        bool validated
+    );
+    event IncidentResolved(bytes32 indexed incidentId);
+    event ChainHealthUpdated(
+        uint16 indexed chainId,
+        bool isHealthy,
+        uint256 trustScore
     );
     event ThresholdUpdated(
-        address indexed contract_,
-        uint256 maxGasPerTx,
-        uint256 maxTxPerBlock
-    );
-    event ContractProtectionEnabled(
-        address indexed contract_,
-        bytes4[] restrictedFunctions
-    );
-    event EmergencyShutdown(
-        bytes32 indexed incidentId,
-        string reason
+        uint16 indexed chainId,
+        string thresholdType,
+        uint256 newValue
     );
 
-    constructor(address _link) {
-        setChainlinkToken(_link);
+    constructor(uint256 validationTimeout) {
         _setupRole(DEFAULT_ADMIN_ROLE, msg.sender);
-        _setupRole(GUARDIAN_ROLE, msg.sender);
+        _setupRole(SECURITY_ADMIN, msg.sender);
+        VALIDATION_TIMEOUT = validationTimeout;
     }
 
-    function enableContractProtection(
-        address contract_,
-        bytes4[] calldata restrictedFunctions,
-        SecurityThreshold calldata threshold
-    ) external onlyRole(GUARDIAN_ROLE) {
-        require(contract_ != address(0), "Invalid contract address");
-        
-        ContractGuard storage guard = protectedContracts[contract_];
-        guard.isProtected = true;
-        
-        for (uint256 i = 0; i < restrictedFunctions.length; i++) {
-            guard.restrictedFunctions[restrictedFunctions[i]] = true;
-        }
-        
-        guard.dailyLimit = threshold.maxValuePerTx;
-        thresholds[contract_] = threshold;
+    function setSecurityThreshold(
+        uint16 chainId,
+        uint256 minTrustScore,
+        uint256 maxLatency,
+        uint256 minParticipation,
+        uint256 consensusThreshold
+    ) external onlyRole(SECURITY_ADMIN) {
+        require(minTrustScore <= 100, "Invalid trust score");
+        require(minParticipation <= 100, "Invalid participation");
+        require(consensusThreshold <= 100, "Invalid consensus threshold");
 
-        emit ContractProtectionEnabled(contract_, restrictedFunctions);
-        emit ThresholdUpdated(
-            contract_,
-            threshold.maxGasPerTx,
-            threshold.maxTxPerBlock
-        );
+        chainThresholds[chainId] = SecurityThreshold({
+            minTrustScore: minTrustScore,
+            maxLatency: maxLatency,
+            minParticipation: minParticipation,
+            consensusThreshold: consensusThreshold
+        });
+
+        emit ThresholdUpdated(chainId, "trustScore", minTrustScore);
+        emit ThresholdUpdated(chainId, "latency", maxLatency);
+        emit ThresholdUpdated(chainId, "participation", minParticipation);
+        emit ThresholdUpdated(chainId, "consensus", consensusThreshold);
     }
 
     function reportSecurityIncident(
-        string calldata incidentType,
-        address target,
-        uint256 severity,
-        bytes calldata evidence
+        uint16 chainId,
+        string memory incidentType,
+        string memory description,
+        uint256 severity
     ) external onlyRole(MONITOR_ROLE) returns (bytes32) {
-        require(severity > 0 && severity <= 10, "Invalid severity");
+        require(severity <= 100, "Invalid severity");
+        require(bytes(incidentType).length > 0, "Empty incident type");
         
         bytes32 incidentId = keccak256(
             abi.encodePacked(
+                chainId,
                 incidentType,
-                target,
                 block.timestamp,
                 msg.sender
             )
@@ -119,174 +118,139 @@ contract SecurityMonitor is AccessControl, ReentrancyGuard, Pausable, ChainlinkC
 
         SecurityIncident storage incident = incidents[incidentId];
         incident.id = incidentId;
-        incident.incidentType = incidentType;
-        incident.target = target;
-        incident.severity = severity;
         incident.timestamp = block.timestamp;
-        incident.evidence = evidence;
+        incident.chainId = chainId;
+        incident.incidentType = incidentType;
+        incident.description = description;
+        incident.severity = severity;
+        incident.resolved = false;
+        incident.validationCount = 0;
 
-        emit SecurityIncidentReported(
-            incidentId,
-            incidentType,
-            target,
-            severity
-        );
-
-        if (severity >= SEVERITY_THRESHOLD) {
-            _initiateEmergencyResponse(incidentId);
+        emit SecurityIncidentReported(incidentId, chainId, incidentType, severity);
+        
+        if (severity >= 80) {
+            _pause();
         }
 
         return incidentId;
     }
 
-    function approveIncidentResolution(bytes32 incidentId)
+    function validateIncident(bytes32 incidentId, bool validate)
         external
-        onlyRole(GUARDIAN_ROLE)
+        onlyRole(SECURITY_ADMIN)
     {
         SecurityIncident storage incident = incidents[incidentId];
-        require(incident.id == incidentId, "Incident not found");
-        require(!incident.isResolved, "Already resolved");
+        require(incident.id != bytes32(0), "Incident not found");
         require(
-            !incident.guardianApprovals[msg.sender],
-            "Already approved"
+            !incident.validations[msg.sender],
+            "Already validated"
+        );
+        require(
+            block.timestamp <= incident.timestamp + VALIDATION_TIMEOUT,
+            "Validation timeout"
         );
 
-        incident.guardianApprovals[msg.sender] = true;
-
-        uint256 approvals = 0;
-        for (uint256 i = 0; i < getRoleMemberCount(GUARDIAN_ROLE); i++) {
-            address guardian = getRoleMember(GUARDIAN_ROLE, i);
-            if (incident.guardianApprovals[guardian]) {
-                approvals++;
-            }
+        incident.validations[msg.sender] = true;
+        if (validate) {
+            incident.validationCount++;
         }
 
-        if (approvals >= thresholds[incident.target].requiredConfirmations) {
-            incident.isResolved = true;
-            emit IncidentResolved(incidentId, msg.sender);
+        emit IncidentValidated(incidentId, msg.sender, validate);
+
+        if (incident.validationCount >= MIN_VALIDATIONS) {
+            _handleValidatedIncident(incident);
         }
     }
 
-    function validateTransaction(
-        address contract_,
-        bytes4 functionSig,
-        uint256 gasLimit,
-        uint256 value
-    ) external view returns (bool) {
-        ContractGuard storage guard = protectedContracts[contract_];
-        if (!guard.isProtected) return true;
-
-        SecurityThreshold storage threshold = thresholds[contract_];
-        
-        // Check function restrictions
-        if (guard.restrictedFunctions[functionSig]) return false;
-
-        // Check gas limit
-        if (gasLimit > threshold.maxGasPerTx) return false;
-
-        // Check value limits
-        if (value > threshold.maxValuePerTx) return false;
-
-        // Check cooldown period
-        if (block.timestamp - guard.lastInteraction[msg.sender] < threshold.cooldownPeriod) {
-            return false;
-        }
-
-        // Check daily limits
-        if (block.timestamp - guard.lastResetTime >= 1 days) {
-            guard.dailyUsed = 0;
-            guard.lastResetTime = block.timestamp;
-        }
-        
-        if (guard.dailyUsed + value > guard.dailyLimit) return false;
-
-        return true;
-    }
-
-    function _initiateEmergencyResponse(bytes32 incidentId) internal {
+    function resolveIncident(bytes32 incidentId)
+        external
+        onlyRole(SECURITY_ADMIN)
+    {
         SecurityIncident storage incident = incidents[incidentId];
-        
-        if (incident.severity >= SEVERITY_THRESHOLD) {
-            // Pause protected contract
-            Pausable(incident.target).pause();
-            
-            // Emit emergency shutdown event
-            emit EmergencyShutdown(
-                incidentId,
-                "Critical security incident detected"
+        require(incident.id != bytes32(0), "Incident not found");
+        require(!incident.resolved, "Already resolved");
+        require(
+            incident.validationCount >= MIN_VALIDATIONS,
+            "Not enough validations"
+        );
+
+        incident.resolved = true;
+        emit IncidentResolved(incidentId);
+
+        if (paused()) {
+            _unpause();
+        }
+    }
+
+    function updateChainHealth(
+        uint16 chainId,
+        uint256 latency,
+        uint256 participation,
+        uint256 trustScore
+    ) external onlyRole(MONITOR_ROLE) {
+        require(trustScore <= 100, "Invalid trust score");
+        require(participation <= 100, "Invalid participation");
+
+        SecurityThreshold memory threshold = chainThresholds[chainId];
+        bool isHealthy = 
+            trustScore >= threshold.minTrustScore &&
+            latency <= threshold.maxLatency &&
+            participation >= threshold.minParticipation;
+
+        chainHealth[chainId] = ChainHealth({
+            lastUpdate: block.timestamp,
+            latency: latency,
+            participation: participation,
+            trustScore: trustScore,
+            isHealthy: isHealthy
+        });
+
+        emit ChainHealthUpdated(chainId, isHealthy, trustScore);
+
+        if (!isHealthy) {
+            reportSecurityIncident(
+                chainId,
+                "HEALTH_CHECK",
+                "Chain health check failed",
+                70
             );
-            
-            // Notify guardians via Chainlink oracle
-            _notifyGuardians(incidentId);
         }
     }
 
-    function _notifyGuardians(bytes32 incidentId) internal {
-        SecurityIncident storage incident = incidents[incidentId];
-        
-        Chainlink.Request memory req = buildChainlinkRequest(
-            keccak256("SECURITY_ALERT"),
-            address(this),
-            this.fulfillNotification.selector
-        );
+    function _handleValidatedIncident(SecurityIncident storage incident)
+        private
+    {
+        if (incident.severity >= 80 && !paused()) {
+            _pause();
+        }
 
-        req.add("incidentId", bytes32ToString(incidentId));
-        req.add("incidentType", incident.incidentType);
-        req.add("target", addressToString(incident.target));
-        req.add("severity", uint256ToString(incident.severity));
-
-        sendChainlinkRequestTo(
-            getRoleMember(MONITOR_ROLE, 0),
-            req,
-            0.1 * 10**18
-        );
+        // Additional handling based on incident type
+        if (keccak256(bytes(incident.incidentType)) == keccak256(bytes("CONSENSUS_FAILURE"))) {
+            // Handle consensus failure
+            _handleConsensusFailure(incident.chainId);
+        } else if (keccak256(bytes(incident.incidentType)) == keccak256(bytes("SECURITY_BREACH"))) {
+            // Handle security breach
+            _handleSecurityBreach(incident.chainId);
+        }
     }
 
-    function bytes32ToString(bytes32 _bytes32) internal pure returns (string memory) {
-        bytes memory bytesArray = new bytes(64);
-        for (uint256 i = 0; i < 32; i++) {
-            bytes1 char = bytes1(uint8(uint256(_bytes32) / (2**(8*(31 - i)))));
-            bytes1 hi = bytes1(uint8(char) / 16);
-            bytes1 lo = bytes1(uint8(char) - 16 * uint8(hi));
-            bytesArray[i*2] = char2hex(hi);
-            bytesArray[i*2+1] = char2hex(lo);
-        }
-        return string(bytesArray);
+    function _handleConsensusFailure(uint16 chainId) private {
+        // Implementation specific to consensus failure
     }
 
-    function char2hex(bytes1 char) internal pure returns (bytes1) {
-        if (uint8(char) < 10) return bytes1(uint8(char) + 0x30);
-        else return bytes1(uint8(char) + 0x57);
+    function _handleSecurityBreach(uint16 chainId) private {
+        // Implementation specific to security breach
     }
 
-    function addressToString(address _addr) internal pure returns (string memory) {
-        bytes memory s = new bytes(40);
-        for (uint i = 0; i < 20; i++) {
-            bytes1 b = bytes1(uint8(uint160(_addr) / (2**(8*(19 - i)))));
-            bytes1 hi = bytes1(uint8(b) / 16);
-            bytes1 lo = bytes1(uint8(b) - 16 * uint8(hi));
-            s[2*i] = char2hex(hi);
-            s[2*i+1] = char2hex(lo);
-        }
-        return string(s);
+    function getIncidentValidations(bytes32 incidentId, address validator)
+        external
+        view
+        returns (bool)
+    {
+        return incidents[incidentId].validations[validator];
     }
 
-    function uint256ToString(uint256 value) internal pure returns (string memory) {
-        if (value == 0) {
-            return "0";
-        }
-        uint256 temp = value;
-        uint256 digits;
-        while (temp != 0) {
-            digits++;
-            temp /= 10;
-        }
-        bytes memory buffer = new bytes(digits);
-        while (value != 0) {
-            digits -= 1;
-            buffer[digits] = bytes1(uint8(48 + uint256(value % 10)));
-            value /= 10;
-        }
-        return string(buffer);
+    function isChainHealthy(uint16 chainId) external view returns (bool) {
+        return chainHealth[chainId].isHealthy;
     }
 } 

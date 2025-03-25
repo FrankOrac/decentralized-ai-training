@@ -3,219 +3,217 @@ pragma solidity ^0.8.19;
 
 import "@openzeppelin/contracts/access/AccessControl.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
-import "@openzeppelin/contracts/utils/math/SafeMath.sol";
 import "./interfaces/ILayerZeroEndpoint.sol";
 
 contract CrossChainGovernance is AccessControl, ReentrancyGuard {
-    using SafeMath for uint256;
+    bytes32 public constant GOVERNANCE_ADMIN = keccak256("GOVERNANCE_ADMIN");
+    bytes32 public constant RELAYER_ROLE = keccak256("RELAYER_ROLE");
 
-    bytes32 public constant BRIDGE_ROLE = keccak256("BRIDGE_ROLE");
-    bytes32 public constant EXECUTOR_ROLE = keccak256("EXECUTOR_ROLE");
+    struct ChainConfig {
+        uint16 chainId;
+        address governanceContract;
+        bool isActive;
+        uint256 trustScore;
+    }
 
     struct CrossChainProposal {
-        uint256 id;
-        uint256 sourceChainId;
-        address sourceProposer;
-        string description;
-        bytes[] calldatas;
+        bytes32 id;
+        uint16 sourceChain;
+        address proposer;
+        string title;
+        bytes[] actions;
         address[] targets;
         uint256[] values;
-        uint256 startTimestamp;
-        uint256 endTimestamp;
-        mapping(uint256 => uint256) chainVotes; // chainId => votes
+        uint256 startTime;
+        uint256 endTime;
+        mapping(uint16 => bool) chainVoted;
+        mapping(uint16 => uint256) chainVotes;
         bool executed;
         bool canceled;
     }
 
-    struct VoteInfo {
-        uint256 chainId;
-        uint256 proposalId;
-        uint256 votes;
-        bytes32 voteHash;
-    }
+    ILayerZeroEndpoint public endpoint;
+    mapping(uint16 => ChainConfig) public chainConfigs;
+    mapping(bytes32 => CrossChainProposal) public proposals;
+    uint256 public minTrustScore = 70;
+    uint256 public proposalThreshold;
+    uint256 public constant EXECUTION_DELAY = 2 days;
 
-    ILayerZeroEndpoint public immutable lzEndpoint;
-    mapping(uint256 => CrossChainProposal) public proposals;
-    mapping(uint256 => mapping(uint256 => bytes32)) public chainVoteHashes; // proposalId => chainId => voteHash
-    uint256 public proposalCount;
-    uint256 public minVotingPeriod;
-    uint256[] public supportedChains;
-
-    event ProposalCreated(
-        uint256 indexed proposalId,
-        uint256 sourceChainId,
-        address sourceProposer,
-        string description
+    event ChainConfigured(
+        uint16 indexed chainId,
+        address governanceContract,
+        uint256 trustScore
     );
-    event VotesReceived(
-        uint256 indexed proposalId,
-        uint256 chainId,
-        uint256 votes,
-        bytes32 voteHash
+    event CrossChainProposalCreated(
+        bytes32 indexed proposalId,
+        uint16 sourceChain,
+        address proposer
     );
-    event ProposalExecuted(uint256 indexed proposalId);
-    event ProposalCanceled(uint256 indexed proposalId);
-    event ChainSupported(uint256 chainId);
-    event ChainRemoved(uint256 chainId);
+    event CrossChainVoteReceived(
+        bytes32 indexed proposalId,
+        uint16 sourceChain,
+        uint256 votes
+    );
+    event ProposalExecuted(bytes32 indexed proposalId);
+    event ProposalCanceled(bytes32 indexed proposalId);
 
-    constructor(
-        address _lzEndpoint,
-        uint256 _minVotingPeriod,
-        uint256[] memory _supportedChains
-    ) {
-        lzEndpoint = ILayerZeroEndpoint(_lzEndpoint);
-        minVotingPeriod = _minVotingPeriod;
-        supportedChains = _supportedChains;
-        
+    constructor(address _endpoint) {
+        endpoint = ILayerZeroEndpoint(_endpoint);
         _setupRole(DEFAULT_ADMIN_ROLE, msg.sender);
-        _setupRole(BRIDGE_ROLE, msg.sender);
-        _setupRole(EXECUTOR_ROLE, msg.sender);
+        _setupRole(GOVERNANCE_ADMIN, msg.sender);
     }
 
-    function createProposal(
+    function configureChain(
+        uint16 chainId,
+        address governanceContract,
+        uint256 trustScore
+    ) external onlyRole(GOVERNANCE_ADMIN) {
+        require(governanceContract != address(0), "Invalid governance contract");
+        require(trustScore <= 100, "Trust score must be <= 100");
+
+        chainConfigs[chainId] = ChainConfig({
+            chainId: chainId,
+            governanceContract: governanceContract,
+            isActive: true,
+            trustScore: trustScore
+        });
+
+        emit ChainConfigured(chainId, governanceContract, trustScore);
+    }
+
+    function createCrossChainProposal(
+        string memory title,
+        bytes[] memory actions,
         address[] memory targets,
         uint256[] memory values,
-        bytes[] memory calldatas,
-        string memory description,
         uint256 votingPeriod
-    ) external returns (uint256) {
-        require(votingPeriod >= minVotingPeriod, "Voting period too short");
+    ) external returns (bytes32) {
         require(
-            targets.length == values.length &&
-            targets.length == calldatas.length,
-            "Invalid proposal length"
+            actions.length == targets.length && targets.length == values.length,
+            "Array length mismatch"
         );
 
-        proposalCount++;
-        CrossChainProposal storage newProposal = proposals[proposalCount];
-        newProposal.id = proposalCount;
-        newProposal.sourceChainId = getChainId();
-        newProposal.sourceProposer = msg.sender;
-        newProposal.description = description;
-        newProposal.targets = targets;
-        newProposal.values = values;
-        newProposal.calldatas = calldatas;
-        newProposal.startTimestamp = block.timestamp;
-        newProposal.endTimestamp = block.timestamp.add(votingPeriod);
-
-        emit ProposalCreated(
-            proposalCount,
-            newProposal.sourceChainId,
+        bytes32 proposalId = keccak256(
+            abi.encodePacked(
+                title,
             msg.sender,
-            description
+                block.timestamp
+            )
         );
 
-        // Notify other chains about the new proposal
-        for (uint256 i = 0; i < supportedChains.length; i++) {
-            if (supportedChains[i] != getChainId()) {
-                _sendProposalToChain(proposalCount, supportedChains[i]);
-            }
-        }
-
-        return proposalCount;
-    }
-
-    function receiveVotes(
-        uint256 proposalId,
-        uint256 sourceChainId,
-        uint256 votes,
-        bytes32 voteHash
-    ) external onlyRole(BRIDGE_ROLE) {
-        require(proposals[proposalId].id != 0, "Proposal doesn't exist");
-        require(!proposals[proposalId].executed, "Proposal already executed");
-        require(!proposals[proposalId].canceled, "Proposal canceled");
-        
-        proposals[proposalId].chainVotes[sourceChainId] = votes;
-        chainVoteHashes[proposalId][sourceChainId] = voteHash;
-
-        emit VotesReceived(proposalId, sourceChainId, votes, voteHash);
-    }
-
-    function executeProposal(uint256 proposalId) external nonReentrant onlyRole(EXECUTOR_ROLE) {
         CrossChainProposal storage proposal = proposals[proposalId];
-        require(proposal.id != 0, "Proposal doesn't exist");
-        require(!proposal.executed, "Proposal already executed");
-        require(!proposal.canceled, "Proposal canceled");
-        require(block.timestamp > proposal.endTimestamp, "Voting period not ended");
-        require(_quorumReached(proposalId), "Quorum not reached");
+        proposal.id = proposalId;
+        proposal.sourceChain = uint16(endpoint.getChainId());
+        proposal.proposer = msg.sender;
+        proposal.title = title;
+        proposal.actions = actions;
+        proposal.targets = targets;
+        proposal.values = values;
+        proposal.startTime = block.timestamp;
+        proposal.endTime = block.timestamp + votingPeriod;
+
+        // Notify other chains about the proposal
+        bytes memory payload = abi.encode(proposalId, title, msg.sender);
+        _notifyChains(payload);
+
+        emit CrossChainProposalCreated(proposalId, proposal.sourceChain, msg.sender);
+        return proposalId;
+    }
+
+    function receiveCrossChainVote(
+        uint16 sourceChain,
+        bytes memory payload
+    ) external onlyRole(RELAYER_ROLE) {
+        require(chainConfigs[sourceChain].isActive, "Chain not active");
+        require(
+            chainConfigs[sourceChain].trustScore >= minTrustScore,
+            "Insufficient trust score"
+        );
+
+        (bytes32 proposalId, uint256 votes) = abi.decode(payload, (bytes32, uint256));
+        CrossChainProposal storage proposal = proposals[proposalId];
+        
+        require(!proposal.chainVoted[sourceChain], "Chain already voted");
+        require(block.timestamp <= proposal.endTime, "Voting period ended");
+
+        proposal.chainVoted[sourceChain] = true;
+        proposal.chainVotes[sourceChain] = votes;
+
+        emit CrossChainVoteReceived(proposalId, sourceChain, votes);
+    }
+
+    function executeProposal(bytes32 proposalId) external nonReentrant {
+        CrossChainProposal storage proposal = proposals[proposalId];
+        require(!proposal.executed && !proposal.canceled, "Proposal not active");
+        require(
+            block.timestamp > proposal.endTime + EXECUTION_DELAY,
+            "Execution delay not passed"
+        );
+
+        uint256 totalVotes = _calculateTotalVotes(proposalId);
+        require(totalVotes >= proposalThreshold, "Insufficient votes");
 
         proposal.executed = true;
 
-        for (uint256 i = 0; i < proposal.targets.length; i++) {
-            (bool success, ) = proposal.targets[i].call{value: proposal.values[i]}(
-                proposal.calldatas[i]
+        for (uint256 i = 0; i < proposal.actions.length; i++) {
+            (bool success,) = proposal.targets[i].call{value: proposal.values[i]}(
+                proposal.actions[i]
             );
-            require(success, "Proposal execution failed");
+            require(success, "Action execution failed");
         }
 
         emit ProposalExecuted(proposalId);
     }
 
-    function cancelProposal(uint256 proposalId) external {
+    function cancelProposal(bytes32 proposalId) external {
         CrossChainProposal storage proposal = proposals[proposalId];
         require(
-            msg.sender == proposal.sourceProposer || hasRole(DEFAULT_ADMIN_ROLE, msg.sender),
+            msg.sender == proposal.proposer ||
+            hasRole(GOVERNANCE_ADMIN, msg.sender),
             "Not authorized"
         );
-        require(!proposal.executed, "Already executed");
-        require(!proposal.canceled, "Already canceled");
+        require(!proposal.executed && !proposal.canceled, "Proposal not active");
 
         proposal.canceled = true;
         emit ProposalCanceled(proposalId);
     }
 
-    function addSupportedChain(uint256 chainId) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        supportedChains.push(chainId);
-        emit ChainSupported(chainId);
-    }
+    function _notifyChains(bytes memory payload) internal {
+        uint256 gasForDestinationLzReceive = 350000;
+        bytes memory adapterParams = abi.encodePacked(gasForDestinationLzReceive);
 
-    function removeSupportedChain(uint256 chainId) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        for (uint256 i = 0; i < supportedChains.length; i++) {
-            if (supportedChains[i] == chainId) {
-                supportedChains[i] = supportedChains[supportedChains.length - 1];
-                supportedChains.pop();
-                emit ChainRemoved(chainId);
-                break;
+        for (uint16 chainId = 0; chainId < 65535; chainId++) {
+            if (chainConfigs[chainId].isActive &&
+                chainId != endpoint.getChainId()) {
+                endpoint.send(
+                    chainId,
+                    abi.encodePacked(chainConfigs[chainId].governanceContract),
+            payload,
+            payable(msg.sender),
+            address(0),
+                    adapterParams
+                );
             }
         }
     }
 
-    function _sendProposalToChain(uint256 proposalId, uint256 targetChainId) internal {
-        bytes memory payload = abi.encode(
-            proposalId,
-            getChainId(),
-            proposals[proposalId].sourceProposer,
-            proposals[proposalId].description
-        );
-
-        lzEndpoint.send(
-            targetChainId,
-            abi.encodePacked(address(this), address(this)),
-            payload,
-            payable(msg.sender),
-            address(0),
-            bytes("")
-        );
-    }
-
-    function _quorumReached(uint256 proposalId) internal view returns (bool) {
+    function _calculateTotalVotes(bytes32 proposalId)
+        internal
+        view
+        returns (uint256)
+    {
         uint256 totalVotes = 0;
-        for (uint256 i = 0; i < supportedChains.length; i++) {
-            totalVotes = totalVotes.add(proposals[proposalId].chainVotes[supportedChains[i]]);
-        }
-        return totalVotes >= getQuorumThreshold();
-    }
+        CrossChainProposal storage proposal = proposals[proposalId];
 
-    function getQuorumThreshold() public pure returns (uint256) {
-        return 100; // Implement your own quorum logic
-    }
-
-    function getChainId() public view returns (uint256) {
-        uint256 chainId;
-        assembly {
-            chainId := chainid()
+        for (uint16 chainId = 0; chainId < 65535; chainId++) {
+            if (proposal.chainVoted[chainId] &&
+                chainConfigs[chainId].isActive &&
+                chainConfigs[chainId].trustScore >= minTrustScore) {
+                totalVotes += proposal.chainVotes[chainId];
+            }
         }
-        return chainId;
+
+        return totalVotes;
     }
 
     receive() external payable {}

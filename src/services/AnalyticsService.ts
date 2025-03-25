@@ -1,125 +1,189 @@
 import { ethers } from 'ethers';
-import { createClient } from '@supabase/supabase-js';
+import { Web3Provider } from '@ethersproject/providers';
+import { CrossChainGovernance } from '../typechain/CrossChainGovernance';
+import { formatEther, parseEther } from 'ethers/lib/utils';
+
+export interface ChainMetrics {
+  chainId: number;
+  trustScore: number;
+  proposalCount: number;
+  totalVotes: number;
+  averageParticipation: number;
+  successRate: number;
+}
+
+export interface ProposalMetrics {
+  id: string;
+  title: string;
+  sourceChain: number;
+  participationRate: number;
+  voteDistribution: Record<number, number>;
+  executionTime?: number;
+  status: 'active' | 'executed' | 'canceled';
+}
+
+export interface NetworkMetrics {
+  totalProposals: number;
+  activeProposals: number;
+  executedProposals: number;
+  averageExecutionTime: number;
+  participationTrend: Array<{ timestamp: number; participation: number }>;
+  chainInteractions: Array<{ source: number; target: number; weight: number }>;
+}
 
 export class AnalyticsService {
-  private supabase;
+  private contract: CrossChainGovernance;
+  private provider: Web3Provider;
 
-  constructor(
-    private contract: ethers.Contract,
-    private provider: ethers.providers.Web3Provider
-  ) {
-    this.supabase = createClient(
-      process.env.NEXT_PUBLIC_SUPABASE_URL!,
-      process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
-    );
+  constructor(contract: CrossChainGovernance, provider: Web3Provider) {
+    this.contract = contract;
+    this.provider = provider;
   }
 
-  async getNetworkStats() {
-    const blockNumber = await this.provider.getBlockNumber();
-    const block = await this.provider.getBlock(blockNumber);
-
-    return {
-      latestBlock: blockNumber,
-      timestamp: block.timestamp,
-      gasPrice: ethers.utils.formatUnits(
-        await this.provider.getGasPrice(),
-        'gwei'
-      ),
-    };
-  }
-
-  async getTaskMetrics() {
-    const taskCount = await this.contract.taskCount();
-    const tasks = await this.fetchAllTasks(taskCount);
-    
-    return {
-      total: tasks.length,
-      completed: tasks.filter(t => t.status === 2).length,
-      active: tasks.filter(t => t.status === 1).length,
-      averageReward: this.calculateAverageReward(tasks),
-      completionRate: this.calculateCompletionRate(tasks),
-      modelTypeDistribution: this.calculateModelTypeDistribution(tasks),
-    };
-  }
-
-  async getContributorMetrics() {
-    const filter = this.contract.filters.TaskCompleted();
-    const events = await this.contract.queryFilter(filter);
-    const contributors = new Set(events.map(e => e.args?.contributor));
-
-    const metrics = await Promise.all(
-      Array.from(contributors).map(async (address) => {
-        const stats = await this.contract.contributors(address);
-        return {
-          address,
-          tasksCompleted: stats.tasksCompleted.toNumber(),
-          reputation: stats.reputation.toNumber(),
-          earnings: ethers.utils.formatEther(stats.earnings),
-        };
-      })
+  async getChainMetrics(): Promise<ChainMetrics[]> {
+    const metrics: ChainMetrics[] = [];
+    const events = await this.contract.queryFilter(
+      this.contract.filters.CrossChainProposalCreated(),
+      0,
+      'latest'
     );
 
+    for (let chainId = 0; chainId < 65535; chainId++) {
+      const config = await this.contract.chainConfigs(chainId);
+      if (!config.isActive) continue;
+
+      const chainProposals = events.filter(
+        e => e.args?.sourceChain === chainId
+      );
+
+      const voteEvents = await this.contract.queryFilter(
+        this.contract.filters.CrossChainVoteReceived(null, chainId),
+        0,
+        'latest'
+      );
+
+      const totalVotes = voteEvents.reduce(
+        (sum, event) => sum + parseFloat(formatEther(event.args?.votes || 0)),
+        0
+      );
+
+      const executedProposals = await Promise.all(
+        chainProposals.map(p => this.contract.proposals(p.args?.proposalId))
+      );
+
+      metrics.push({
+        chainId,
+        trustScore: config.trustScore.toNumber(),
+        proposalCount: chainProposals.length,
+        totalVotes,
+        averageParticipation: chainProposals.length > 0 ?
+          totalVotes / chainProposals.length : 0,
+        successRate: chainProposals.length > 0 ?
+          executedProposals.filter(p => p.executed).length / chainProposals.length : 0
+      });
+    }
+
+    return metrics;
+  }
+
+  async getProposalMetrics(): Promise<ProposalMetrics[]> {
+    const metrics: ProposalMetrics[] = [];
+    const events = await this.contract.queryFilter(
+      this.contract.filters.CrossChainProposalCreated(),
+      0,
+      'latest'
+    );
+
+    for (const event of events) {
+      const proposal = await this.contract.proposals(event.args?.proposalId);
+      const voteEvents = await this.contract.queryFilter(
+        this.contract.filters.CrossChainVoteReceived(event.args?.proposalId),
+        0,
+        'latest'
+      );
+
+      const voteDistribution: Record<number, number> = {};
+      let totalVotes = 0;
+
+      for (const voteEvent of voteEvents) {
+        const chainId = voteEvent.args?.sourceChain.toNumber() || 0;
+        const votes = parseFloat(formatEther(voteEvent.args?.votes || 0));
+        voteDistribution[chainId] = votes;
+        totalVotes += votes;
+      }
+
+      const executionEvent = await this.contract.queryFilter(
+        this.contract.filters.ProposalExecuted(event.args?.proposalId),
+        0,
+        'latest'
+      );
+
+      metrics.push({
+        id: event.args?.proposalId,
+        title: proposal.title,
+        sourceChain: proposal.sourceChain.toNumber(),
+        participationRate: totalVotes / (await this.getTotalVotingPower()),
+        voteDistribution,
+        executionTime: executionEvent[0]?.blockNumber ?
+          (await this.provider.getBlock(executionEvent[0].blockNumber)).timestamp -
+          proposal.startTime.toNumber() : undefined,
+        status: proposal.executed ? 'executed' :
+                proposal.canceled ? 'canceled' : 'active'
+      });
+    }
+
+    return metrics;
+  }
+
+  async getNetworkMetrics(): Promise<NetworkMetrics> {
+    const proposals = await this.getProposalMetrics();
+    const now = Math.floor(Date.now() / 1000);
+    const thirtyDaysAgo = now - 30 * 24 * 60 * 60;
+
+    // Calculate participation trend
+    const participationTrend: Array<{ timestamp: number; participation: number }> = [];
+    for (let t = thirtyDaysAgo; t <= now; t += 24 * 60 * 60) {
+      const relevantProposals = proposals.filter(
+        p => p.executionTime && p.executionTime <= t
+      );
+      participationTrend.push({
+        timestamp: t,
+        participation: relevantProposals.reduce(
+          (sum, p) => sum + p.participationRate,
+          0
+        ) / (relevantProposals.length || 1)
+      });
+    }
+
+    // Calculate chain interactions
+    const chainInteractions: Array<{ source: number; target: number; weight: number }> = [];
+    proposals.forEach(proposal => {
+      Object.entries(proposal.voteDistribution).forEach(([chainId, votes]) => {
+        chainInteractions.push({
+          source: proposal.sourceChain,
+          target: parseInt(chainId),
+          weight: votes
+        });
+      });
+    });
+
+    const executedProposals = proposals.filter(p => p.status === 'executed');
+
     return {
-      totalContributors: contributors.size,
-      topContributors: metrics.sort((a, b) => b.tasksCompleted - a.tasksCompleted).slice(0, 10),
-      averageEarnings: this.calculateAverageEarnings(metrics),
-      reputationDistribution: this.calculateReputationDistribution(metrics),
+      totalProposals: proposals.length,
+      activeProposals: proposals.filter(p => p.status === 'active').length,
+      executedProposals: executedProposals.length,
+      averageExecutionTime: executedProposals.reduce(
+        (sum, p) => sum + (p.executionTime || 0),
+        0
+      ) / (executedProposals.length || 1),
+      participationTrend,
+      chainInteractions
     };
   }
 
-  async trackEvent(eventType: string, data: any) {
-    await this.supabase
-      .from('analytics_events')
-      .insert([
-        {
-          event_type: eventType,
-          data,
-          timestamp: new Date(),
-        },
-      ]);
-  }
-
-  private calculateAverageReward(tasks: any[]) {
-    const rewards = tasks.map(t => parseFloat(ethers.utils.formatEther(t.reward)));
-    return rewards.reduce((a, b) => a + b, 0) / rewards.length;
-  }
-
-  private calculateCompletionRate(tasks: any[]) {
-    const completed = tasks.filter(t => t.status === 2).length;
-    return (completed / tasks.length) * 100;
-  }
-
-  private calculateModelTypeDistribution(tasks: any[]) {
-    const distribution = tasks.reduce((acc: any, task) => {
-      acc[task.modelTypeId] = (acc[task.modelTypeId] || 0) + 1;
-      return acc;
-    }, {});
-
-    return Object.entries(distribution).map(([type, count]) => ({
-      type,
-      count,
-      percentage: (Number(count) / tasks.length) * 100,
-    }));
-  }
-
-  private calculateReputationDistribution(contributors: any[]) {
-    const ranges = [
-      { min: 0, max: 10 },
-      { min: 11, max: 50 },
-      { min: 51, max: 100 },
-      { min: 101, max: Infinity },
-    ];
-
-    return ranges.map(range => ({
-      range: `${range.min}-${range.max === Infinity ? '∞' : range.max}`,
-      count: contributors.filter(c => 
-        c.reputation >= range.min && c.reputation <= range.max
-      ).length,
-    }));
-  }
-
-  private calculateAverageEarnings(contributors: any[]) {
-    const earnings = contributors.map(c => parseFloat(c.earnings));
-    return earnings.reduce((a, b) => a + b, 0) / earnings.length;
+  private async getTotalVotingPower(): Promise<number> {
+    // Implementation depends on your voting power calculation logic
+    return parseFloat(formatEther(parseEther('1000000'))); // Example value
   }
 } 
