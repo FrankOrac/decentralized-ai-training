@@ -1,7 +1,11 @@
+import React, { useState, useEffect } from 'react';
 import {
   Box,
-  Button,
-  Stack,
+  VStack,
+  HStack,
+  Grid,
+  Heading,
+  Text,
   Table,
   Thead,
   Tbody,
@@ -9,8 +13,20 @@ import {
   Th,
   Td,
   Badge,
+  Button,
   Alert,
   AlertIcon,
+  Stat,
+  StatLabel,
+  StatNumber,
+  StatHelpText,
+  StatArrow,
+  Tabs,
+  TabList,
+  TabPanels,
+  Tab,
+  TabPanel,
+  useToast,
   Modal,
   ModalOverlay,
   ModalContent,
@@ -22,242 +38,307 @@ import {
   Input,
   Select,
   useDisclosure,
-  useToast,
-} from "@chakra-ui/react";
-import { useState, useEffect } from "react";
-import { useWeb3 } from "../context/Web3Context";
+} from '@chakra-ui/react';
+import {
+  LineChart,
+  Line,
+  BarChart,
+  Bar,
+  XAxis,
+  YAxis,
+  CartesianGrid,
+  Tooltip,
+  Legend,
+  ResponsiveContainer,
+} from 'recharts';
+import { useWeb3 } from '../hooks/useWeb3';
+
+interface SecurityMetrics {
+  totalAudits: number;
+  passedAudits: number;
+  activeThreats: number;
+  resolvedThreats: number;
+  averageAuditScore: number;
+  lastUpdateTimestamp: number;
+}
+
+interface ThreatAlert {
+  id: string;
+  alertType: string;
+  severity: number;
+  description: string;
+  timestamp: number;
+  isResolved: boolean;
+}
+
+interface SecurityAudit {
+  id: string;
+  auditType: string;
+  contractAddress: string;
+  timestamp: number;
+  score: number;
+  findings: string;
+  passed: boolean;
+}
 
 export function SecurityDashboard() {
   const { contract } = useWeb3();
-  const [incidents, setIncidents] = useState([]);
-  const [systemStatus, setSystemStatus] = useState({
-    isPaused: false,
-    rateLimitExceeded: false,
-  });
-  const { isOpen, onOpen, onClose } = useDisclosure();
   const toast = useToast();
+  const { isOpen, onOpen, onClose } = useDisclosure();
 
-  const [newIncident, setNewIncident] = useState({
-    description: "",
-    severity: "Low",
-  });
+  const [metrics, setMetrics] = useState<SecurityMetrics | null>(null);
+  const [threats, setThreats] = useState<ThreatAlert[]>([]);
+  const [audits, setAudits] = useState<SecurityAudit[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [selectedContract, setSelectedContract] = useState<string>('');
 
   useEffect(() => {
     if (contract) {
-      fetchIncidents();
-      checkSystemStatus();
+      fetchSecurityData();
+      const interval = setInterval(fetchSecurityData, 30000);
+      return () => clearInterval(interval);
     }
-  }, [contract]);
+  }, [contract, selectedContract]);
 
-  const fetchIncidents = async () => {
+  const fetchSecurityData = async () => {
     try {
-      const count = await contract.incidentCount();
-      const fetchedIncidents = [];
+      setLoading(true);
 
-      for (let i = 1; i <= count; i++) {
-        const incident = await contract.getIncidentDetails(i);
-        fetchedIncidents.push({
-          id: i,
-          ...incident,
+      // Fetch security metrics
+      if (selectedContract) {
+        const contractMetrics = await contract.contractMetrics(selectedContract);
+        setMetrics({
+          totalAudits: contractMetrics.totalAudits.toNumber(),
+          passedAudits: contractMetrics.passedAudits.toNumber(),
+          activeThreats: contractMetrics.activeThreats.toNumber(),
+          resolvedThreats: contractMetrics.resolvedThreats.toNumber(),
+          averageAuditScore: contractMetrics.averageAuditScore.toNumber(),
+          lastUpdateTimestamp: contractMetrics.lastUpdateTimestamp.toNumber()
         });
       }
 
-      setIncidents(fetchedIncidents);
-    } catch (error) {
-      console.error("Error fetching incidents:", error);
-    }
-  };
-
-  const checkSystemStatus = async () => {
-    try {
-      const paused = await contract.paused();
-      setSystemStatus((prev) => ({ ...prev, isPaused: paused }));
-    } catch (error) {
-      console.error("Error checking system status:", error);
-    }
-  };
-
-  const handleReportIncident = async () => {
-    try {
-      const tx = await contract.reportIncident(
-        newIncident.description,
-        ["Low", "Medium", "High", "Critical"].indexOf(newIncident.severity)
+      // Fetch recent threats
+      const threatFilter = contract.filters.ThreatDetected();
+      const threatEvents = await contract.queryFilter(threatFilter);
+      const threatData = await Promise.all(
+        threatEvents.map(async (event) => {
+          const threat = await contract.threats(event.args?.threatId);
+          return {
+            id: event.args?.threatId,
+            alertType: threat.alertType,
+            severity: threat.severity.toNumber(),
+            description: threat.description,
+            timestamp: threat.timestamp.toNumber(),
+            isResolved: threat.isResolved
+          };
+        })
       );
-      await tx.wait();
+      setThreats(threatData);
 
-      toast({
-        title: "Incident Reported",
-        description: "Security incident has been reported successfully",
-        status: "success",
-      });
+      // Fetch recent audits
+      const auditFilter = contract.filters.AuditCompleted();
+      const auditEvents = await contract.queryFilter(auditFilter);
+      const auditData = await Promise.all(
+        auditEvents.map(async (event) => {
+          const audit = await contract.audits(event.args?.auditId);
+          return {
+            id: event.args?.auditId,
+            auditType: audit.auditType,
+            contractAddress: audit.contractAddress,
+            timestamp: audit.timestamp.toNumber(),
+            score: audit.score.toNumber(),
+            findings: audit.findings,
+            passed: audit.passed
+          };
+        })
+      );
+      setAudits(auditData);
 
-      onClose();
-      fetchIncidents();
-    } catch (error: any) {
+    } catch (error) {
+      console.error('Error fetching security data:', error);
       toast({
-        title: "Error",
-        description: error.message,
-        status: "error",
+        title: 'Error fetching security data',
+        status: 'error',
+        duration: 5000
       });
+    } finally {
+      setLoading(false);
     }
   };
 
-  const handleUpdateStatus = async (incidentId: number, status: number) => {
-    try {
-      const tx = await contract.updateIncidentStatus(incidentId, status, "");
-      await tx.wait();
-
-      toast({
-        title: "Status Updated",
-        description: "Incident status has been updated",
-        status: "success",
-      });
-
-      fetchIncidents();
-    } catch (error: any) {
-      toast({
-        title: "Error",
-        description: error.message,
-        status: "error",
-      });
+  const getSeverityColor = (severity: number) => {
+    switch (severity) {
+      case 3: return 'red';
+      case 2: return 'orange';
+      case 1: return 'yellow';
+      default: return 'gray';
     }
+  };
+
+  const formatTimestamp = (timestamp: number) => {
+    return new Date(timestamp * 1000).toLocaleString();
   };
 
   return (
     <Box p={6}>
-      <Stack spacing={6}>
-        {systemStatus.isPaused && (
-          <Alert status="error">
-            <AlertIcon />
-            System is currently paused due to security concerns
-          </Alert>
+      <VStack spacing={6} align="stretch">
+        <HStack justify="space-between">
+          <Heading size="lg">Security Monitor</Heading>
+          <Select
+            placeholder="Select Contract"
+            value={selectedContract}
+            onChange={(e) => setSelectedContract(e.target.value)}
+            width="300px"
+          >
+            {/* Add contract options */}
+          </Select>
+        </HStack>
+
+        {metrics && (
+          <Grid templateColumns="repeat(4, 1fr)" gap={6}>
+            <Stat>
+              <StatLabel>Security Score</StatLabel>
+              <StatNumber>{metrics.averageAuditScore}%</StatNumber>
+              <StatHelpText>
+                <StatArrow type="increase" />
+                From last audit
+              </StatHelpText>
+            </Stat>
+
+            <Stat>
+              <StatLabel>Active Threats</StatLabel>
+              <StatNumber>{metrics.activeThreats}</StatNumber>
+              <StatHelpText>
+                {metrics.resolvedThreats} resolved
+              </StatHelpText>
+            </Stat>
+
+            <Stat>
+              <StatLabel>Audit Success Rate</StatLabel>
+              <StatNumber>
+                {(metrics.passedAudits / metrics.totalAudits * 100).toFixed(1)}%
+              </StatNumber>
+              <StatHelpText>
+                {metrics.totalAudits} total audits
+              </StatHelpText>
+            </Stat>
+
+            <Stat>
+              <StatLabel>Last Update</StatLabel>
+              <StatNumber>
+                {formatTimestamp(metrics.lastUpdateTimestamp)}
+              </StatNumber>
+            </Stat>
+          </Grid>
         )}
 
-        <Button colorScheme="blue" onClick={onOpen}>
-          Report Security Incident
-        </Button>
+        <Tabs>
+          <TabList>
+            <Tab>Active Threats</Tab>
+            <Tab>Audit History</Tab>
+            <Tab>Security Metrics</Tab>
+          </TabList>
 
-        <Table variant="simple">
-          <Thead>
-            <Tr>
-              <Th>ID</Th>
-              <Th>Reporter</Th>
-              <Th>Severity</Th>
-              <Th>Status</Th>
-              <Th>Timestamp</Th>
-              <Th>Actions</Th>
-            </Tr>
-          </Thead>
-          <Tbody>
-            {incidents.map((incident: any) => (
-              <Tr key={incident.id}>
-                <Td>{incident.id}</Td>
-                <Td>{`${incident.reporter.slice(
-                  0,
-                  6
-                )}...${incident.reporter.slice(-4)}`}</Td>
-                <Td>
-                  <Badge
-                    colorScheme={
-                      incident.severity === 3
-                        ? "red"
-                        : incident.severity === 2
-                        ? "orange"
-                        : incident.severity === 1
-                        ? "yellow"
-                        : "green"
-                    }
+          <TabPanels>
+            <TabPanel>
+              <Table variant="simple">
+                <Thead>
+                  <Tr>
+                    <Th>Type</Th>
+                    <Th>Severity</Th>
+                    <Th>Description</Th>
+                    <Th>Detected</Th>
+                    <Th>Status</Th>
+                  </Tr>
+                </Thead>
+                <Tbody>
+                  {threats.map((threat) => (
+                    <Tr key={threat.id}>
+                      <Td>{threat.alertType}</Td>
+                      <Td>
+                        <Badge colorScheme={getSeverityColor(threat.severity)}>
+                          {threat.severity === 3 ? 'Critical' :
+                           threat.severity === 2 ? 'High' : 'Medium'}
+                        </Badge>
+                      </Td>
+                      <Td>{threat.description}</Td>
+                      <Td>{formatTimestamp(threat.timestamp)}</Td>
+                      <Td>
+                        <Badge
+                          colorScheme={threat.isResolved ? 'green' : 'red'}
+                        >
+                          {threat.isResolved ? 'Resolved' : 'Active'}
+                        </Badge>
+                      </Td>
+                    </Tr>
+                  ))}
+                </Tbody>
+              </Table>
+            </TabPanel>
+
+            <TabPanel>
+              <Table variant="simple">
+                <Thead>
+                  <Tr>
+                    <Th>Contract</Th>
+                    <Th>Type</Th>
+                    <Th>Score</Th>
+                    <Th>Result</Th>
+                    <Th>Date</Th>
+                  </Tr>
+                </Thead>
+                <Tbody>
+                  {audits.map((audit) => (
+                    <Tr key={audit.id}>
+                      <Td>{`${audit.contractAddress.slice(0, 6)}...${audit.contractAddress.slice(-4)}`}</Td>
+                      <Td>{audit.auditType}</Td>
+                      <Td>{audit.score}%</Td>
+                      <Td>
+                        <Badge
+                          colorScheme={audit.passed ? 'green' : 'red'}
+                        >
+                          {audit.passed ? 'Passed' : 'Failed'}
+                        </Badge>
+                      </Td>
+                      <Td>{formatTimestamp(audit.timestamp)}</Td>
+                    </Tr>
+                  ))}
+                </Tbody>
+              </Table>
+            </TabPanel>
+
+            <TabPanel>
+              <Box height="400px">
+                <ResponsiveContainer>
+                  <LineChart
+                    data={audits.map((audit) => ({
+                      timestamp: audit.timestamp,
+                      score: audit.score
+                    }))}
                   >
-                    {["Low", "Medium", "High", "Critical"][incident.severity]}
-                  </Badge>
-                </Td>
-                <Td>
-                  <Badge
-                    colorScheme={
-                      incident.status === 2
-                        ? "green"
-                        : incident.status === 3
-                        ? "red"
-                        : "yellow"
-                    }
-                  >
-                    {
-                      ["Reported", "Investigating", "Resolved", "Dismissed"][
-                        incident.status
-                      ]
-                    }
-                  </Badge>
-                </Td>
-                <Td>{new Date(incident.timestamp * 1000).toLocaleString()}</Td>
-                <Td>
-                  <Stack direction="row" spacing={2}>
-                    <Button
-                      size="sm"
-                      colorScheme="green"
-                      onClick={() => handleUpdateStatus(incident.id, 2)}
-                    >
-                      Resolve
-                    </Button>
-                    <Button
-                      size="sm"
-                      colorScheme="red"
-                      onClick={() => handleUpdateStatus(incident.id, 3)}
-                    >
-                      Dismiss
-                    </Button>
-                  </Stack>
-                </Td>
-              </Tr>
-            ))}
-          </Tbody>
-        </Table>
-
-        <Modal isOpen={isOpen} onClose={onClose}>
-          <ModalOverlay />
-          <ModalContent>
-            <ModalHeader>Report Security Incident</ModalHeader>
-            <ModalCloseButton />
-            <ModalBody>
-              <Stack spacing={4}>
-                <FormControl>
-                  <FormLabel>Description</FormLabel>
-                  <Input
-                    value={newIncident.description}
-                    onChange={(e) =>
-                      setNewIncident({
-                        ...newIncident,
-                        description: e.target.value,
-                      })
-                    }
-                  />
-                </FormControl>
-
-                <FormControl>
-                  <FormLabel>Severity</FormLabel>
-                  <Select
-                    value={newIncident.severity}
-                    onChange={(e) =>
-                      setNewIncident({
-                        ...newIncident,
-                        severity: e.target.value,
-                      })
-                    }
-                  >
-                    <option value="Low">Low</option>
-                    <option value="Medium">Medium</option>
-                    <option value="High">High</option>
-                    <option value="Critical">Critical</option>
-                  </Select>
-                </FormControl>
-
-                <Button colorScheme="blue" onClick={handleReportIncident}>
-                  Submit Report
-                </Button>
-              </Stack>
-            </ModalBody>
-          </ModalContent>
-        </Modal>
-      </Stack>
+                    <CartesianGrid strokeDasharray="3 3" />
+                    <XAxis
+                      dataKey="timestamp"
+                      tickFormatter={formatTimestamp}
+                    />
+                    <YAxis />
+                    <Tooltip
+                      labelFormatter={formatTimestamp}
+                    />
+                    <Legend />
+                    <Line
+                      type="monotone"
+                      dataKey="score"
+                      stroke="#8884d8"
+                      name="Security Score"
+                    />
+                  </LineChart>
+                </ResponsiveContainer>
+              </Box>
+            </TabPanel>
+          </TabPanels>
+        </Tabs>
+      </VStack>
     </Box>
   );
 }
